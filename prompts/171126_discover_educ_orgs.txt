@@ -1,0 +1,29 @@
+171126 — discover-educ-orgs
+
+Goal
+----
+Build a daily automation that finds 10 NEW schools/associations per day (AU + US + UK)
+like those in manually_found_educ_leads, and saves them to a new Supabase table.
+Must dedup against manually_found_educ_leads so it never re-surfaces existing leads.
+
+Decisions
+---------
+- Org-level only (no contact/email enrichment).
+- Apify only as the data source (Google Maps scraper).
+- AU + US + UK from day one.
+- Filter: independent/private + size signal, plus education associations.
+- Target: 10 net-new per day (configurable), stop once reached.
+
+Build (Supabase project aivitcomiywiysrfwqxt / MAGTestProject)
+--------------------------------------------------------------
+- Tables: auto_found_educ_leads (output), educ_discovery_runs (audit),
+  educ_discovery_config (region x term grid), educ_discovery_settings (tunables).
+- Edge function discover-educ-orgs: rotating cursor over the grid, Apify scrape,
+  normalize/classify/filter, dedup vs both tables, upsert until TARGET_NEW,
+  background + 202, debug params ?dry/?sync/?target/?region, pg_cron daily 06:00 PHT.
+- Reuse the Apify call pattern from apify-platforms-sync; upsert-only (never truncate).
+
+Known tradeoff
+--------------
+Google Maps returns no enrollment, so ">=600 students" is approximated via search
+terms + reviews_floor + keywords; enrollment column kept nullable for future enrichment.

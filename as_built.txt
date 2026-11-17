@@ -1,0 +1,59 @@
+================================================================================
+AS-BUILT — education_sector_lead_finder
+Last updated: 2026-11-17
+================================================================================
+
+Purpose: daily automation that finds ~10 NET-NEW elite K-12 independent schools /
+education associations (AU + US + UK) via Apify Google Maps, deduped against
+manually_found_educ_leads, saved to auto_found_educ_leads. Org-level only.
+Supabase project: MAGTestProject (ref aivitcomiywiysrfwqxt, ap-northeast-1).
+
+SCRIPTS
+- supabase/functions/discover-educ-orgs/index.ts — Deno edge function (deployed as
+  v5, verify_jwt=false). Loads settings + dedup set, walks educ_discovery_config
+  cells oldest-first, scrapes, filters, dedups, upserts until target_new, stamps the
+  cursor, writes an audit row. Background + 202 for cron. Time-boxed by MAX_RUN_MS
+  (default 120000) so it always exits cleanly before the edge wall-clock limit.
+  Debug params: ?sync=1, ?dry=1, ?target=N, ?region=X, ?probe=1|2|3 (raw Apify call).
+  Requires: edge-function secrets APIFY_API_TOKEN, PUSH_SHARED_SECRET (?token= guard);
+  SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are injected. Optional: APIFY_ACTOR_GOOGLE_MAPS,
+  APIFY_RUN_TIMEOUT_S, MAX_RUN_MS.
+- supabase/functions/_shared/apify.ts — Apify run-sync-get-dataset-items helper
+  (retry on 429/5xx, abort timeout) + apifyProbe diagnostic.
+- supabase/functions/_shared/normalize.ts — name normalisation, school/association
+  classification, category- and keyword-aware passesFilter.
+- supabase/migrations/0001..0004_*.sql — schema + grid seed + elite-K12 tuning.
+- supabase/schedule_discover_educ_orgs.sql — pg_cron template (token placeholder only).
+- supabase/SETUP-discover-educ-orgs.md — setup / tuning steps.
+  Deploys go through the Supabase MCP (CLI blocked); pass index.ts plus both _shared files.
+
+EXTERNAL INTEGRATIONS
+- Apify (api.apify.com) — REST, actor compass/crawler-google-places. The location must
+  be inside searchStringsArray ("<term> in <region>, <country>"); a separate
+  locationQuery returns [] and city/country fields make the run fail.
+  Credential: APIFY_API_TOKEN edge-function secret (shared with apify-platforms-sync).
+
+DATA STORES (Supabase public schema, RLS on, no policies = service-role only)
+- auto_found_educ_leads — output. Upsert on unique (org_name_norm, country). 25 rows as
+  of 2026-11-17 (includes 10 pre-tuning Melbourne rows with some VET/business colleges).
+- educ_discovery_runs — append-only per-run audit.
+- educ_discovery_config — region x search-term grid, rotating cursor via last_run_at.
+  Elite terms: independent/grammar/private/preparatory/boarding school and
+  independent schools association. Retired terms are disabled, not deleted.
+  max_results = 20.
+- educ_discovery_settings — single row id=1: target_new=10, reviews_floor=15,
+  max_cells_run=40, include/exclude keywords, include/exclude categories.
+- manually_found_educ_leads — pre-existing; read-only dedup source (account column).
+
+AUTOMATIONS / ROUTINES
+- discover-educ-orgs-daily (pg_cron jobid 44, active) — '0 22 * * *' (06:00 PHT);
+  net.http_post to the edge function. The shared token is embedded in the cron command
+  stored in the database (same convention as the sibling educ cron jobs).
+
+KNOWN LIMITATIONS
+- Google Maps has no enrollment data; "big/independent" is approximated by search
+  terms, category filter and reviews_floor. enrollment column stays null.
+- The 120s time-box can yield fewer than 10 on small-metro rotations.
+- Peak bodies without an association keyword in the name classify as 'school'.
+- Never truncate/delete (global rule): existing orgs are skipped, never duplicated.
+================================================================================
