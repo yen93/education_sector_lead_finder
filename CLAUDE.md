@@ -15,6 +15,11 @@ contact enrichment). See `as_built.txt` for the current-state inventory.
   Associations skip the category and reviews checks.
 - **Dedups against `manually_found_educ_leads.account` AND `auto_found_educ_leads`**
   (normalised names), upserts until `target_new` (10), time-boxed by `MAX_RUN_MS` (120s).
+- **Mirrors to Google Sheets**: appends unlogged orgs (driven by `auto_found_educ_leads.logged_to_sheet_at`)
+  to the `ai_scraped_educ_leads` tab via a service account (`GOOGLE_SERVICE_ACCOUNT_JSON`,
+  `_shared/sheets.ts`), then stamps `logged_to_sheet_at`. Columns A-F: org_name, school_or_association,
+  country, region, website, category (NO phone; col G "Liv's Remark" is human). Non-fatal — a failed
+  append leaves rows unlogged so the next run retries. Record: `educ_discovery_runs.sheet_appended/sheet_error`.
 - Daily via `pg_cron` -> `net.http_post` at `0 22 * * *` (06:00 PHT), job `discover-educ-orgs-daily`.
 
 ## Rules
@@ -23,8 +28,8 @@ contact enrichment). See `as_built.txt` for the current-state inventory.
 - Secrets stay as edge-function secrets, never in the repo. The `?token=` guard is the
   shared `PUSH_SHARED_SECRET`; do not paste it into files or chat logs.
 - Deploy via **Supabase MCP** `deploy_edge_function` (`verify_jwt=false`) passing
-  `functions/discover-educ-orgs/index.ts` + both `functions/_shared/*.ts` — the CLI is
-  blocked on this machine. A deploy replaces all files, so always resend all three.
+  `functions/discover-educ-orgs/index.ts` + all three `functions/_shared/*.ts` — the CLI is
+  blocked on this machine. A deploy replaces all files, so always resend all four.
 - The user handles all git/commits.
 
 ## Gotchas (learned the hard way)
@@ -38,16 +43,23 @@ contact enrichment). See `as_built.txt` for the current-state inventory.
   runs with `select net.http_post(...)` via `execute_sql` and read `net._http_response`
   plus `educ_discovery_runs`. `?sync=1` runs inline; without it the function returns 202.
 - Runs fired via net.http_post log `trigger='cron'` in the audit table even when manual.
+- The sheet append is positional (columns A:F). If anyone adds/removes/reorders columns in the
+  `ai_scraped_educ_leads` tab, update the row mapping in `index.ts` and redeploy, or rows misalign.
+  (The phone column was deleted from the sheet on 2026-11-17 and the mapping updated.)
+- The Sheets connector `append_values` tool takes no `value_input_option`; the function's own
+  append uses USER_ENTERED.
 
 ## Layout
-- `supabase/functions/discover-educ-orgs/index.ts`, `supabase/functions/_shared/{apify,normalize}.ts`
-- `supabase/migrations/0001..0004_*.sql` — tables, audit, grid + settings, elite-K12 tuning
+- `supabase/functions/discover-educ-orgs/index.ts`, `supabase/functions/_shared/{apify,normalize,sheets}.ts`
+- `supabase/migrations/0001..0006_*.sql` — tables, audit, grid + settings, elite-K12 tuning,
+  sheet-sync audit columns (0005), `logged_to_sheet_at` marker (0006)
 - `supabase/schedule_discover_educ_orgs.sql` — cron template (token placeholder)
 - `supabase/SETUP-discover-educ-orgs.md` — setup and tuning
 - `prompts/171126_discover_educ_orgs.txt` — original task spec
 
 ## Tables
-- `auto_found_educ_leads` (output), `educ_discovery_runs` (append-only audit),
+- `auto_found_educ_leads` (output; `status` stays 'new', `logged_to_sheet_at` is the sheet-sync marker),
+  `educ_discovery_runs` (append-only audit, incl. sheet_appended/sheet_error),
   `educ_discovery_config` (grid), `educ_discovery_settings` (single row: target_new,
   reviews_floor, max_cells_run, include/exclude keywords and categories).
 

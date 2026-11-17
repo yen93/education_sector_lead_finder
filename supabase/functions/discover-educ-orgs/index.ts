@@ -16,6 +16,7 @@
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 import { apifyProbe, apifyScrape, hasApifyToken } from "../_shared/apify.ts";
+import { appendRows, hasSheetsSA } from "../_shared/sheets.ts";
 import {
   type Candidate,
   normName,
@@ -33,6 +34,12 @@ const ACTOR = Deno.env.get("APIFY_ACTOR_GOOGLE_MAPS") ?? "compass/crawler-google
 // Hard wall so the run always exits cleanly (writes audit + cursor stamps) before
 // the edge runtime kills it, even if the target isn't reached.
 const MAX_RUN_MS = parseInt(Deno.env.get("MAX_RUN_MS") ?? "120000", 10);
+
+// Mirror unlogged orgs into a Google Sheet tab. Columns A..F, in order:
+// org_name | school_or_association | country | region | website | category
+// (col G "Liv's Remark" is a human column, left untouched).
+const SHEET_ID = Deno.env.get("SHEETS_SPREADSHEET_ID") ?? "1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I";
+const SHEET_TAB = Deno.env.get("SHEETS_TAB") ?? "ai_scraped_educ_leads";
 
 const COUNTRY_NAME: Record<string, string> = {
   AU: "Australia",
@@ -66,6 +73,8 @@ type Summary = {
   cells_processed: Array<{ country: string; region: string; search_term: string; found: number; kept: number }>;
   apify_runs: Array<{ actor: string; cell: string; items: number; error?: string }>;
   sample: Array<{ org_name: string; country: string | null; school_or_association: string }>;
+  sheet_appended: number;
+  sheet_error: string | null;
   ok: boolean;
   error: string | null;
   duration_ms: number;
@@ -124,6 +133,8 @@ async function run(opts: RunOpts): Promise<Summary> {
     cells_processed: [],
     apify_runs: [],
     sample: [],
+    sheet_appended: 0,
+    sheet_error: null,
     ok: false,
     error: null,
     duration_ms: 0,
@@ -235,6 +246,46 @@ async function run(opts: RunOpts): Promise<Summary> {
       }
     }
 
+    // Mirror unlogged orgs into the Google Sheet. Driven by logged_to_sheet_at so
+    // this run's new rows AND any prior rows whose append failed get picked up;
+    // non-fatal (the DB is the source of truth). Sheet columns, in order:
+    // org_name | school_or_association | country | region | website | category
+    // (col G "Liv's Remark" is a human column and is left untouched).
+    if (!opts.dry) {
+      try {
+        const { data: pending, error: pendErr } = await db
+          .from("auto_found_educ_leads")
+          .select("id, org_name, school_or_association, country, region, website, category")
+          .is("logged_to_sheet_at", null)
+          .order("id", { ascending: true })
+          .limit(500);
+        if (pendErr) throw new Error(`load unlogged: ${pendErr.message}`);
+        if (pending && pending.length > 0) {
+          if (!hasSheetsSA()) throw new Error("Missing GOOGLE_SERVICE_ACCOUNT_JSON");
+          // deno-lint-ignore no-explicit-any
+          const rows = pending.map((r: any) => [
+            r.org_name,
+            r.school_or_association,
+            r.country ?? "",
+            r.region ?? "",
+            r.website ?? "",
+            r.category ?? "",
+          ]);
+          s.sheet_appended = await appendRows(SHEET_ID, `${SHEET_TAB}!A:F`, rows);
+          // deno-lint-ignore no-explicit-any
+          const ids = pending.map((r: any) => r.id);
+          const { error: markErr } = await db
+            .from("auto_found_educ_leads")
+            .update({ logged_to_sheet_at: new Date().toISOString() })
+            .in("id", ids);
+          if (markErr) throw new Error(`mark logged: ${markErr.message}`);
+        }
+      } catch (sheetErr) {
+        s.sheet_error = sheetErr instanceof Error ? sheetErr.message : String(sheetErr);
+        console.error("[discover-educ-orgs] sheet sync failed:", s.sheet_error);
+      }
+    }
+
     s.ok = true;
     s.duration_ms = Date.now() - started;
 
@@ -249,6 +300,8 @@ async function run(opts: RunOpts): Promise<Summary> {
         updated: 0,
         skipped_existing: s.skipped_existing,
         apify_runs: s.apify_runs,
+        sheet_appended: s.sheet_appended,
+        sheet_error: s.sheet_error,
         ok: true,
         error: null,
         duration_ms: s.duration_ms,
@@ -277,6 +330,8 @@ async function run(opts: RunOpts): Promise<Summary> {
           updated: 0,
           skipped_existing: s.skipped_existing,
           apify_runs: s.apify_runs,
+          sheet_appended: s.sheet_appended,
+          sheet_error: s.sheet_error,
           ok: false,
           error: s.error,
           duration_ms: s.duration_ms,

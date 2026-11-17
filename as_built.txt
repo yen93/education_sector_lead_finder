@@ -10,33 +10,45 @@ Supabase project: MAGTestProject (ref aivitcomiywiysrfwqxt, ap-northeast-1).
 
 SCRIPTS
 - supabase/functions/discover-educ-orgs/index.ts — Deno edge function (deployed as
-  v5, verify_jwt=false). Loads settings + dedup set, walks educ_discovery_config
+  v7, verify_jwt=false). Loads settings + dedup set, walks educ_discovery_config
   cells oldest-first, scrapes, filters, dedups, upserts until target_new, stamps the
-  cursor, writes an audit row. Background + 202 for cron. Time-boxed by MAX_RUN_MS
+  cursor, then appends every row with logged_to_sheet_at IS NULL to the Google Sheet and
+  stamps it (non-fatal), and writes an audit row. Background + 202 for cron. Time-boxed by MAX_RUN_MS
   (default 120000) so it always exits cleanly before the edge wall-clock limit.
   Debug params: ?sync=1, ?dry=1, ?target=N, ?region=X, ?probe=1|2|3 (raw Apify call).
   Requires: edge-function secrets APIFY_API_TOKEN, PUSH_SHARED_SECRET (?token= guard);
   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are injected. Optional: APIFY_ACTOR_GOOGLE_MAPS,
-  APIFY_RUN_TIMEOUT_S, MAX_RUN_MS.
+  APIFY_RUN_TIMEOUT_S, MAX_RUN_MS, SHEETS_SPREADSHEET_ID, SHEETS_TAB. Also needs
+  GOOGLE_SERVICE_ACCOUNT_JSON for the sheet mirror.
 - supabase/functions/_shared/apify.ts — Apify run-sync-get-dataset-items helper
   (retry on 429/5xx, abort timeout) + apifyProbe diagnostic.
 - supabase/functions/_shared/normalize.ts — name normalisation, school/association
   classification, category- and keyword-aware passesFilter.
-- supabase/migrations/0001..0004_*.sql — schema + grid seed + elite-K12 tuning.
+- supabase/functions/_shared/sheets.ts — service-account (JWT->OAuth2) Google Sheets
+  values:append. Requires GOOGLE_SERVICE_ACCOUNT_JSON (same SA alternate-lead-finder uses).
+- supabase/migrations/0001..0006_*.sql — schema + grid seed + elite-K12 tuning +
+  sheet-sync audit cols (0005) + logged_to_sheet_at marker (0006).
 - supabase/schedule_discover_educ_orgs.sql — pg_cron template (token placeholder only).
 - supabase/SETUP-discover-educ-orgs.md — setup / tuning steps.
-  Deploys go through the Supabase MCP (CLI blocked); pass index.ts plus both _shared files.
+  Deploys go through the Supabase MCP (CLI blocked); pass index.ts plus all three _shared files.
 
 EXTERNAL INTEGRATIONS
 - Apify (api.apify.com) — REST, actor compass/crawler-google-places. The location must
   be inside searchStringsArray ("<term> in <region>, <country>"); a separate
   locationQuery returns [] and city/country fields make the run fail.
   Credential: APIFY_API_TOKEN edge-function secret (shared with apify-platforms-sync).
+- Google Sheets (Sales Automations Sheet, id 1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I,
+  tab "ai_scraped_educ_leads") — unlogged orgs appended via service account (25 existing
+  orgs were backfilled once via the Sheets connector). Columns A-F:
+  org_name | school_or_association | country | region | website | category (NO phone;
+  col G "Liv's Remark" is human, left untouched). Credential: GOOGLE_SERVICE_ACCOUNT_JSON.
 
 DATA STORES (Supabase public schema, RLS on, no policies = service-role only)
-- auto_found_educ_leads — output. Upsert on unique (org_name_norm, country). 25 rows as
+- auto_found_educ_leads — output. Upsert on unique (org_name_norm, country). 31 rows as
   of 2026-11-17 (includes 10 pre-tuning Melbourne rows with some VET/business colleges).
-- educ_discovery_runs — append-only per-run audit.
+  logged_to_sheet_at marks rows already mirrored to the Google Sheet (NULL = pending; the
+  function appends and stamps these, so a failed append is retried next run).
+- educ_discovery_runs — append-only per-run audit (incl. sheet_appended, sheet_error).
 - educ_discovery_config — region x search-term grid, rotating cursor via last_run_at.
   Elite terms: independent/grammar/private/preparatory/boarding school and
   independent schools association. Retired terms are disabled, not deleted.
