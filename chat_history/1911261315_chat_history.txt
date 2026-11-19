@@ -1,0 +1,82 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-11-19
+Session: Add a point-of-contact (POC name + role) enrichment pass to the education
+         sector lead finder, using the Apify DeepMine LinkedIn actor (mirroring the
+         Alternate Lead Finder), then backfill all existing orgs.
+================================================================================
+
+NOTE ON REDACTIONS: The shared edge-function guard token (PUSH_SHARED_SECRET) was
+read from the existing cron.job command inside SQL and used in net.http_post URLs,
+but it was never displayed in tool output and is not reproduced here. The Apify
+token and Google service-account JSON were not displayed. No other credentials
+appeared. (The reference folder contains local secret files, which were not opened.)
+
+--------------------------------------------------------------------------------
+USER:
+Asked to modify the lead finder so it also gets a POC name and role, using Apify,
+and pointed at C:\Users\Cloverly\claude_code\Alternate Lead Finder as a reference.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Read the project as_built.txt and the discover-educ-orgs edge function, plus the
+reference project's CLAUDE.md, as_built.txt and alternate-lead-finder/index.ts.
+Key finding: the reference uses Apify actor deepmine~linkedin-company-employees,
+which searches public LinkedIn by company NAME and returns firstName/lastName/
+jobTitle/headline (no emails); it solves the ~150s edge wall-clock limit with
+parallel single-company searches bounded by concurrency plus a wall-clock guard.
+Checked the auto_found_educ_leads columns via Supabase (project
+aivitcomiywiysrfwqxt).
+
+--------------------------------------------------------------------------------
+USER:
+(Answered questions) POC roles: school-tailored set. Architecture: mirror the
+Alternate Lead Finder's strategy for the wall-clock problem. Sheet: DB only for now.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Presented a plan, then built it:
+- Migration 0007_poc_enrichment.sql (additive): poc_firstname, poc_lastname,
+  poc_role, poc_searched_at (+ index) on auto_found_educ_leads; poc_searched and
+  poc_found on educ_discovery_runs. Applied via the Supabase MCP.
+- New _shared/deepmine.ts: deepmineSearch (by org name), school-tailored
+  priority-ordered TARGET_ROLE_GROUPS (outdoor/experiential -> co-curricular/camps
+  -> business/operations/bursar -> principal/deputy/head -> development ->
+  events -> marketing/admissions -> membership/PL), pickBestPoc.
+- index.ts: enrichPocs pass (parallel, DEEPMINE_CONCURRENCY=10, POC_MAX_ORGS=10,
+  POC_BUDGET_MS=60s carved out of MAX_RUN_MS, wall-clock guard), audit counters,
+  ?pocprobe=<org> debug param. Type-checked (only the known Deno/esm errors).
+- Deployed as v10 via Supabase MCP (index + all four _shared files).
+Validation: ?pocprobe on "Sydney Grammar School" returned 100 people and picked
+Rita Fin, Deputy Headmaster (Co-curricular). A ?sync=1&target=0 run searched 10
+orgs, found 3, ok, 62s. One bad result surfaced (Blue Lotus College stored a
+tagline as role), so added looksLikeJobTitle (rejects >70 chars, >8 words, or
+ending in .?!), redeployed as v11, and nulled the bad value in place.
+Updated CLAUDE.md and as_built.txt. Did not commit.
+
+--------------------------------------------------------------------------------
+USER:
+Asked to backfill auto_found_educ_leads where the 3 POC columns are null.
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Found 47 POC-null rows (39 never searched, 8 searched with no match). Re-opened the
+8 by clearing poc_searched_at (in-place update, no deletes), then ran the POC pass
+five times (?sync=1&target=0, 10 orgs per run, ~75s each) until none remained.
+Final state: 49 orgs, all searched, 20 with a POC, 29 searched with no
+target-role match (mostly low-quality pre-tuning VET/"college" rows). Sample
+matches: Ascham School (Head of Co-curricular P-12), California Association of
+Independent Schools (Events Manager), Independent Schools Association (Head of
+Professional Development and Events). No git commands run.
+
+--------------------------------------------------------------------------------
+USER:
+Invoked /dcp (save chat history, update as_built.txt / CLAUDE.md / .gitignore, no git).
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Saved this transcript. as_built.txt and CLAUDE.md were already updated during the
+session and left as-is; .gitignore already covers secrets and was left alone.
+
+================================================================================
+END OF EXPORT
+================================================================================

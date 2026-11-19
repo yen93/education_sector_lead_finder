@@ -1,33 +1,52 @@
 ================================================================================
 AS-BUILT — education_sector_lead_finder
-Last updated: 2026-11-17
+Last updated: 2026-11-19
 ================================================================================
 
 Purpose: daily automation that finds ~10 NET-NEW elite K-12 independent schools /
 education associations (AU + US + UK) via Apify Google Maps, deduped against
-manually_found_educ_leads, saved to auto_found_educ_leads. Org-level only.
-Supabase project: MAGTestProject (ref aivitcomiywiysrfwqxt, ap-northeast-1).
+manually_found_educ_leads, saved to auto_found_educ_leads, THEN enriches each org
+with ONE point-of-contact (name + role, NO email) found on public LinkedIn via the
+Apify actor deepmine~linkedin-company-employees. Supabase project: MAGTestProject
+(ref aivitcomiywiysrfwqxt, ap-northeast-1).
 
 SCRIPTS
 - supabase/functions/discover-educ-orgs/index.ts — Deno edge function (deployed as
-  v7, verify_jwt=false). Loads settings + dedup set, walks educ_discovery_config
+  v11, verify_jwt=false). Loads settings + dedup set, walks educ_discovery_config
   cells oldest-first, scrapes, filters, dedups, upserts until target_new, stamps the
-  cursor, then appends every row with logged_to_sheet_at IS NULL to the Google Sheet and
-  stamps it (non-fatal), and writes an audit row. Background + 202 for cron. Time-boxed by MAX_RUN_MS
-  (default 120000) so it always exits cleanly before the edge wall-clock limit.
-  Debug params: ?sync=1, ?dry=1, ?target=N, ?region=X, ?probe=1|2|3 (raw Apify call).
+  cursor, THEN runs the POC enrichment pass (see below), then appends every row with
+  logged_to_sheet_at IS NULL to the Google Sheet and stamps it (non-fatal), and writes an
+  audit row. Background + 202 for cron. Time-boxed by MAX_RUN_MS (default 120000); the
+  discovery loop stops at MAX_RUN_MS - POC_BUDGET_MS so the POC pass always gets its window.
+  Debug params: ?sync=1, ?dry=1, ?target=N (?target=0 = POC pass only), ?region=X,
+  ?probe=1|2|3 (raw Maps call), ?pocprobe=<org name> (raw DeepMine search, no writes).
   Requires: edge-function secrets APIFY_API_TOKEN, PUSH_SHARED_SECRET (?token= guard);
   SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are injected. Optional: APIFY_ACTOR_GOOGLE_MAPS,
-  APIFY_RUN_TIMEOUT_S, MAX_RUN_MS, SHEETS_SPREADSHEET_ID, SHEETS_TAB. Also needs
+  APIFY_RUN_TIMEOUT_S, MAX_RUN_MS, SHEETS_SPREADSHEET_ID, SHEETS_TAB; POC knobs POC_MAX_ORGS
+  (10), DEEPMINE_CONCURRENCY (10), POC_BUDGET_MS (60000), POC_FLUSH_RESERVE_MS (8000),
+  DEEPMINE_MAX_RESULTS (100), DEEPMINE_TIMEOUT_S (90), DEEPMINE_ACTOR. Also needs
   GOOGLE_SERVICE_ACCOUNT_JSON for the sheet mirror.
+- POC PASS (enrichPocs in index.ts + _shared/deepmine.ts): loads auto_found_educ_leads rows
+  with poc_searched_at IS NULL (oldest id first, so the backlog backfills), dedups by
+  org_name_norm, runs up to POC_MAX_ORGS DeepMine searches in parallel (bounded by
+  DEEPMINE_CONCURRENCY) with a wall-clock guard. Per org: pick ONE person whose job TITLE
+  matches a school-tailored priority-ordered role list (outdoor/experiential/expeditions ->
+  co-curricular/camps/excursions/tours -> business/operations/bursar -> principal/deputy/head
+  -> development/advancement -> events/conference -> marketing/comms/admissions ->
+  membership/PL); store poc_firstname/lastname/role + stamp poc_searched_at. No match ->
+  stamp only (not re-searched). Provider error / out of budget -> leave NULL (retries next run).
+  looksLikeJobTitle drops tagline "titles" (>70 chars, >8 words, or ending in .?!).
 - supabase/functions/_shared/apify.ts — Apify run-sync-get-dataset-items helper
-  (retry on 429/5xx, abort timeout) + apifyProbe diagnostic.
+  (retry on 429/5xx, abort timeout) + apifyProbe diagnostic (Google Maps scraper).
+- supabase/functions/_shared/deepmine.ts — DeepMine POC provider: deepmineSearch (by org
+  NAME), school-tailored TARGET_ROLE_GROUPS, pickBestPoc (highest-priority title match),
+  looksLikeJobTitle tagline guard. Names + titles only, NO emails. Reuses APIFY_API_TOKEN.
 - supabase/functions/_shared/normalize.ts — name normalisation, school/association
   classification, category- and keyword-aware passesFilter.
 - supabase/functions/_shared/sheets.ts — service-account (JWT->OAuth2) Google Sheets
   values:append. Requires GOOGLE_SERVICE_ACCOUNT_JSON (same SA alternate-lead-finder uses).
-- supabase/migrations/0001..0006_*.sql — schema + grid seed + elite-K12 tuning +
-  sheet-sync audit cols (0005) + logged_to_sheet_at marker (0006).
+- supabase/migrations/0001..0007_*.sql — schema + grid seed + elite-K12 tuning +
+  sheet-sync audit cols (0005) + logged_to_sheet_at marker (0006) + POC enrichment cols (0007).
 - supabase/schedule_discover_educ_orgs.sql — pg_cron template (token placeholder only).
 - supabase/SETUP-discover-educ-orgs.md — setup / tuning steps.
   Deploys go through the Supabase MCP (CLI blocked); pass index.ts plus all three _shared files.
@@ -37,6 +56,11 @@ EXTERNAL INTEGRATIONS
   be inside searchStringsArray ("<term> in <region>, <country>"); a separate
   locationQuery returns [] and city/country fields make the run fail.
   Credential: APIFY_API_TOKEN edge-function secret (shared with apify-platforms-sync).
+- Apify actor deepmine~linkedin-company-employees (POC pass) — searches public LinkedIn by
+  company NAME (no cookies), input {companies:[name], maxResults, enrichProfiles:false},
+  returns firstName/lastName/jobTitle/headline (NO emails); ~40s per org; partial coverage
+  (~0-3 target-role people per org). Same APIFY_API_TOKEN. jobTitle is sometimes a tagline
+  (guarded by looksLikeJobTitle).
 - Google Sheets (Sales Automations Sheet, id 1svksxHmNBUx9Z20t2kbtHAT1fThcfdCmz5dEp936L7I,
   tab "ai_scraped_educ_leads") — unlogged orgs appended via service account (25 existing
   orgs were backfilled once via the Sheets connector). Columns A-F:
@@ -48,7 +72,11 @@ DATA STORES (Supabase public schema, RLS on, no policies = service-role only)
   of 2026-11-17 (includes 10 pre-tuning Melbourne rows with some VET/business colleges).
   logged_to_sheet_at marks rows already mirrored to the Google Sheet (NULL = pending; the
   function appends and stamps these, so a failed append is retried next run).
-- educ_discovery_runs — append-only per-run audit (incl. sheet_appended, sheet_error).
+  POC columns (added 2026-11-19, migration 0007): poc_firstname, poc_lastname, poc_role
+  (one LinkedIn contact in a target role, NO email), poc_searched_at (POC-pass marker;
+  NULL = not yet searched, stamped even when no POC found; clear to NULL to retry).
+- educ_discovery_runs — append-only per-run audit (incl. sheet_appended, sheet_error,
+  and poc_searched / poc_found counters added in 0007).
 - educ_discovery_config — region x search-term grid, rotating cursor via last_run_at.
   Elite terms: independent/grammar/private/preparatory/boarding school and
   independent schools association. Retired terms are disabled, not deleted.

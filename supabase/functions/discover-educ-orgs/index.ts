@@ -7,12 +7,19 @@
 // time, until TARGET_NEW net-new orgs are saved (or cells / safety cap run out),
 // stamping last_run_at so the next day continues where this one stopped.
 //
+// After discovery it runs a POC enrichment pass: for each org not yet searched it
+// looks up ONE person in a target role on public LinkedIn (Apify actor
+// deepmine~linkedin-company-employees, by org NAME) and stores poc_firstname/
+// poc_lastname/poc_role (name + role only, NO email). Searches run in parallel inside
+// a reserved time budget (mirrors the Alternate Lead Finder's wall-clock strategy).
+//
 // Triggered by pg_cron (net.http_post). Kicks real work into a background task
 // and returns 202 so it never hits the request timeout.
 // Secrets: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, APIFY_API_TOKEN, PUSH_SHARED_SECRET.
 // Deploy --no-verify-jwt.
 // Debug params: ?sync=1 (run inline + return JSON), ?dry=1 (no DB writes),
-//               ?target=N (override net-new target), ?region=Sydney (filter cells).
+//               ?target=N (override net-new target), ?region=Sydney (filter cells),
+//               ?probe=1|2|3 (raw Maps call), ?pocprobe=<org name> (raw POC search, no writes).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2.45.4";
 import { apifyProbe, apifyScrape, hasApifyToken } from "../_shared/apify.ts";
@@ -24,6 +31,13 @@ import {
   type Settings,
   toCandidate,
 } from "../_shared/normalize.ts";
+import {
+  deepmineSearch,
+  DEEPMINE_ACTOR,
+  hasDeepmineToken,
+  isTargetRole,
+  pickBestPoc,
+} from "../_shared/deepmine.ts";
 
 declare const EdgeRuntime: { waitUntil(p: Promise<unknown>): void } | undefined;
 
@@ -32,8 +46,24 @@ const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const PUSH_SHARED_SECRET = Deno.env.get("PUSH_SHARED_SECRET") ?? "";
 const ACTOR = Deno.env.get("APIFY_ACTOR_GOOGLE_MAPS") ?? "compass/crawler-google-places";
 // Hard wall so the run always exits cleanly (writes audit + cursor stamps) before
-// the edge runtime kills it, even if the target isn't reached.
+// the edge runtime kills it, even if the target isn't reached. This is the OVERALL
+// budget shared by the discovery loop and the POC pass; keep it under the edge
+// wall-clock (~150s).
 const MAX_RUN_MS = parseInt(Deno.env.get("MAX_RUN_MS") ?? "120000", 10);
+
+// --- POC (point-of-contact) enrichment pass ---------------------------------
+// After discovery, search public LinkedIn by ORG NAME (Apify actor
+// deepmine~linkedin-company-employees) and record ONE person in a target role
+// (name + role only; no emails) for each not-yet-searched org. Mirrors the
+// Alternate Lead Finder's strategy for the wall-clock problem: all searches run in
+// PARALLEL, bounded by DEEPMINE_CONCURRENCY, inside a reserved time budget so the
+// isolate never dies mid-flush.
+const POC_MAX_ORGS = parseInt(Deno.env.get("POC_MAX_ORGS") ?? "10", 10); // distinct orgs searched per run
+const DEEPMINE_CONCURRENCY = parseInt(Deno.env.get("DEEPMINE_CONCURRENCY") ?? "10", 10); // parallel org searches
+// Time carved out of MAX_RUN_MS for the POC pass (discovery stops this early), and
+// the headroom kept inside the pass for the final DB updates + audit row.
+const POC_BUDGET_MS = parseInt(Deno.env.get("POC_BUDGET_MS") ?? "60000", 10);
+const POC_FLUSH_RESERVE_MS = parseInt(Deno.env.get("POC_FLUSH_RESERVE_MS") ?? "8000", 10);
 
 // Mirror unlogged orgs into a Google Sheet tab. Columns A..F, in order:
 // org_name | school_or_association | country | region | website | category
@@ -75,6 +105,10 @@ type Summary = {
   sample: Array<{ org_name: string; country: string | null; school_or_association: string }>;
   sheet_appended: number;
   sheet_error: string | null;
+  poc_searched: number;
+  poc_found: number;
+  poc_error: string | null;
+  poc_sample: Array<{ org_name: string; poc_name: string; poc_role: string }>;
   ok: boolean;
   error: string | null;
   duration_ms: number;
@@ -118,6 +152,89 @@ async function loadDedupSet(db: any): Promise<Set<string>> {
   return seen;
 }
 
+// Run `fn` over `items` with at most `limit` promises in flight at once.
+async function mapLimit<T>(items: T[], limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) await fn(items[next++]);
+    }),
+  );
+}
+
+// POC enrichment pass. Loads not-yet-searched orgs (oldest id first, so the existing
+// backlog backfills alongside this run's new rows), dedups by org_name_norm, and runs
+// up to POC_MAX_ORGS DeepMine searches in parallel. For each org:
+//   - a target-role person found -> store poc_firstname/lastname/role + stamp poc_searched_at
+//   - search ran, nobody matched  -> stamp poc_searched_at only (not re-searched)
+//   - provider error / out of budget -> leave poc_searched_at NULL (retries next run)
+// Never deletes; all writes are in-place updates keyed by id (global upsert-only rule).
+// deno-lint-ignore no-explicit-any
+async function enrichPocs(db: any, s: Summary, started: number, dry: boolean): Promise<void> {
+  if (!hasDeepmineToken()) return; // no provider configured; skip silently
+
+  try {
+    // Over-fetch so dedup-by-norm still yields POC_MAX_ORGS distinct orgs.
+    const { data: pending, error } = await db
+      .from("auto_found_educ_leads")
+      .select("id, org_name, org_name_norm")
+      .is("poc_searched_at", null)
+      .order("id", { ascending: true })
+      .limit(POC_MAX_ORGS * 5);
+    if (error) throw new Error(`load pending: ${error.message}`);
+    if (!pending || pending.length === 0) return;
+
+    // Distinct orgs by normalised name -> all row ids sharing that name.
+    const byNorm = new Map<string, { name: string; ids: number[] }>();
+    for (const r of pending as Array<{ id: number; org_name: string; org_name_norm: string }>) {
+      const key = r.org_name_norm;
+      const existing = byNorm.get(key);
+      if (existing) { existing.ids.push(r.id); continue; }
+      if (byNorm.size >= POC_MAX_ORGS) continue; // cap distinct orgs; the rest wait for next run
+      byNorm.set(key, { name: r.org_name, ids: [r.id] });
+    }
+
+    const entries = [...byNorm.values()];
+    await mapLimit(entries, DEEPMINE_CONCURRENCY, async (e) => {
+      // Wall-clock guard: don't start a search that can't finish before the flush.
+      if (Date.now() - started > MAX_RUN_MS - POC_FLUSH_RESERVE_MS) return;
+
+      const people = await deepmineSearch(e.name);
+      if (people === null) return; // provider failure: leave unstamped, retry next run
+      s.poc_searched += 1;
+
+      const poc = pickBestPoc(people);
+      const stampedAt = new Date().toISOString();
+      const update = poc
+        ? { poc_firstname: poc.poc_firstname, poc_lastname: poc.poc_lastname, poc_role: poc.poc_role, poc_searched_at: stampedAt }
+        : { poc_searched_at: stampedAt };
+
+      if (!dry) {
+        const { error: upErr } = await db
+          .from("auto_found_educ_leads")
+          .update(update)
+          .in("id", e.ids);
+        if (upErr) { console.warn(`[poc] update failed for "${e.name}": ${upErr.message}`); return; }
+      }
+
+      if (poc) {
+        s.poc_found += 1;
+        if (s.poc_sample.length < 15) {
+          s.poc_sample.push({
+            org_name: e.name,
+            poc_name: `${poc.poc_firstname} ${poc.poc_lastname}`,
+            poc_role: poc.poc_role,
+          });
+        }
+      }
+    });
+    console.log(`[discover-educ-orgs] poc pass: searched ${s.poc_searched}, found ${s.poc_found}.`);
+  } catch (err) {
+    s.poc_error = err instanceof Error ? err.message : String(err);
+    console.error("[discover-educ-orgs] poc pass failed:", s.poc_error);
+  }
+}
+
 async function run(opts: RunOpts): Promise<Summary> {
   const started = Date.now();
   const s: Summary = {
@@ -135,6 +252,10 @@ async function run(opts: RunOpts): Promise<Summary> {
     sample: [],
     sheet_appended: 0,
     sheet_error: null,
+    poc_searched: 0,
+    poc_found: 0,
+    poc_error: null,
+    poc_sample: [],
     ok: false,
     error: null,
     duration_ms: 0,
@@ -167,9 +288,15 @@ async function run(opts: RunOpts): Promise<Summary> {
     if (cellErr) throw new Error(`load cells: ${cellErr.message}`);
     if (!cells || cells.length === 0) throw new Error("No enabled config cells to scan");
 
+    // Leave room at the end of the overall budget for the POC pass (only when a
+    // provider token is configured; otherwise discovery can use the whole budget).
+    const discoveryBudgetMs = hasDeepmineToken()
+      ? Math.max(0, MAX_RUN_MS - POC_BUDGET_MS)
+      : MAX_RUN_MS;
+
     for (const cell of cells) {
       if (s.inserted >= target) break;
-      if (Date.now() - started > MAX_RUN_MS) break; // time-box; save what we have
+      if (Date.now() - started > discoveryBudgetMs) break; // time-box; save room for POC
 
       const locationQuery = `${cell.region}, ${COUNTRY_NAME[cell.country] ?? cell.country}`;
       // This actor needs the location inside the search string (a separate
@@ -246,6 +373,11 @@ async function run(opts: RunOpts): Promise<Summary> {
       }
     }
 
+    // POC enrichment pass: for each org not yet searched, find ONE person in a target
+    // role via LinkedIn (name + role only, no email). Runs AFTER discovery, inside the
+    // reserved POC budget, all searches in parallel (bounded) with a wall-clock guard.
+    await enrichPocs(db, s, started, opts.dry);
+
     // Mirror unlogged orgs into the Google Sheet. Driven by logged_to_sheet_at so
     // this run's new rows AND any prior rows whose append failed get picked up;
     // non-fatal (the DB is the source of truth). Sheet columns, in order:
@@ -302,6 +434,8 @@ async function run(opts: RunOpts): Promise<Summary> {
         apify_runs: s.apify_runs,
         sheet_appended: s.sheet_appended,
         sheet_error: s.sheet_error,
+        poc_searched: s.poc_searched,
+        poc_found: s.poc_found,
         ok: true,
         error: null,
         duration_ms: s.duration_ms,
@@ -332,6 +466,8 @@ async function run(opts: RunOpts): Promise<Summary> {
           apify_runs: s.apify_runs,
           sheet_appended: s.sheet_appended,
           sheet_error: s.sheet_error,
+          poc_searched: s.poc_searched,
+          poc_found: s.poc_found,
           ok: false,
           error: s.error,
           duration_ms: s.duration_ms,
@@ -381,6 +517,25 @@ Deno.serve(async (req: Request) => {
     } catch (err) {
       return json({ actor: ACTOR, variant, input, error: err instanceof Error ? err.message : String(err) }, 500);
     }
+  }
+
+  // Diagnostic: ?pocprobe=<org name> runs the DeepMine POC search directly (no writes)
+  // and shows the people returned, which pass the target-role filter, and the single
+  // POC the picker would store. The actor searches by org NAME.
+  if (url.searchParams.get("pocprobe")) {
+    const org = url.searchParams.get("pocprobe")!;
+    const info: Record<string, unknown> = { actor: DEEPMINE_ACTOR, org, hasToken: hasDeepmineToken() };
+    try {
+      const people = await deepmineSearch(org);
+      info.returned = people ? people.length : null; // null = provider failure (see logs)
+      info.targets = people
+        ? people.filter(isTargetRole).map((p) => ({ name: `${p.first_name} ${p.last_name}`, role: p.position ?? p.headline }))
+        : null;
+      info.picked = people ? pickBestPoc(people) : null;
+    } catch (err) {
+      info.error = err instanceof Error ? err.message : String(err);
+    }
+    return json(info);
   }
 
   const dry = url.searchParams.get("dry") === "1";
